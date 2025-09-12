@@ -1,0 +1,6 @@
+fastapi
+uvicorn
+langroid
+python-dotenv
+sse-starlette
+httpx
