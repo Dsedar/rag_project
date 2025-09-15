@@ -15,7 +15,7 @@ from sentence_transformers import CrossEncoder
 from pymilvus import Collection, connections
 
 # Конфигурация
-MODEL_ID = "Tlite"
+MODEL_ID = "Tpro"
 TOKEN = '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'
 DATA_PATH = 'rp/witcher3_knowledge_base.json'
 MILVUS_HOST = "localhost"
@@ -179,7 +179,7 @@ def generate_paraphrases(query: str, num_paraphrases: int = 3) -> List[str]:
     Ответь только списком переформулированных запросов, без дополнительных комментариев.
     """
     data = {
-        "model": "Tlite",
+        "model": MODEL_ID,
         "messages": [{"role": "user", "content": prompt}],
         "temperature": 0.7,
         "max_tokens": 200
@@ -204,7 +204,7 @@ def generate_related_queries(query: str, categories: List[str]) -> List[str]:
     Ответь только списком этих категорий, так как они записаны, без дополнительных комментариев.
     """
     data = {
-        "model": "Tlite",
+        "model": MODEL_ID,
         "messages": [{"role": "user", "content": prompt}],
         #"temperature": 0.7,
         "max_tokens": 400
