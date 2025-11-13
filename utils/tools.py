@@ -7,7 +7,7 @@ from pymilvus import MilvusClient
 from sentence_transformers import SentenceTransformer
 
 # --- Настройки ---
-MILVUS_URI = "http://localhost:19530"
+MILVUS_URI = "порт"
 EMBEDDING_MODEL = "BAAI/bge-m3"
 COLLECTION_NAME = "witcher3_rag"
 

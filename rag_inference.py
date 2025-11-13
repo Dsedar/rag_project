@@ -15,15 +15,15 @@ from sentence_transformers import CrossEncoder
 from pymilvus import Collection, connections
 
 # Конфигурация
-MODEL_ID = "Tpro"
-TOKEN = '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'
+MODEL_ID = "имя модели"
+TOKEN = 'ваш токен'
 DATA_PATH = 'rp/witcher3_knowledge_base.json'
 MILVUS_HOST = "localhost"
-MILVUS_PORT = "19530"
+MILVUS_PORT = "порт milvus"
 COLLECTION_NAME = "witcher3_rag"
 
-os.environ["OPENAI_API_BASE"] = "http://192.168.2.87:8000/v1"
-os.environ["OPENAI_API_KEY"] = "api-fake"
+os.environ["OPENAI_API_BASE"] = "адрес сервера"
+os.environ["OPENAI_API_KEY"] = "ключ"
 
 class HybridMilvusRetriever(BaseRetriever):
     """
