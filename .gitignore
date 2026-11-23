@@ -1,5 +1,49 @@
-__pycache__/** 
-logs/**
-venv/**
-rp/witcher3_knowledge_base.json
-witcher3_knowledge_base.json
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Virtual Environments
+venv/
+.venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# Environment variables & secrets
+.env
+.env.local
+*.env
+
+# Logs and databases
+logs/
+*.log
+
+# Jupyter Notebook
+.ipynb_checkpoints/
+*/.ipynb_checkpoints/*
+
+# IDE and Editor configs
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+.DS_Store
+
+# Testing and coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Milvus docker data & temporary files
+volumes/
+minio_data/
+etcd_data/
+milvus_data/
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/

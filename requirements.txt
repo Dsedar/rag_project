@@ -1,6 +1,29 @@
-fastapi
-uvicorn
-langroid
-python-dotenv
-sse-starlette
-httpx
+# Core RAG & LLM Framework
+langchain>=0.2.0
+langchain-core>=0.2.0
+langchain-openai>=0.1.0
+langchain-milvus>=0.1.0
+langchain-huggingface>=0.0.1
+langchain-community>=0.2.0
+
+# Vector Database
+pymilvus>=2.4.0
+
+# Embeddings & Reranker
+sentence-transformers>=2.7.0
+torch>=2.0.0
+
+# Web Scraping & HTML Processing
+requests>=2.31.0
+beautifulsoup4>=4.12.0
+html2text>=2020.1.16
+
+# Utilities & Environment
+python-dotenv>=1.0.0
+pydantic>=2.0.0
+tqdm>=4.66.0
+
+# Optional: Agent Tools & Web API
+langroid>=0.1.0
+fastapi>=0.110.0
+uvicorn>=0.28.0

@@ -1,196 +1,297 @@
+"""
+Индексация базы знаний Ведьмака 3 в векторную базу данных Milvus:
+- Загрузка статей из JSON
+- Умный чанкинг по смысловым абзацам
+- Пакетная генерация эмбеддингов через BAAI/bge-m3
+- Создание коллекции Milvus со схемой и HNSW индексом
+- Запись данных и построение индекса
+"""
+
+import argparse
 import json
+import logging
+import sys
 import time
 from pathlib import Path
-from typing import List, Dict
-from sentence_transformers import SentenceTransformer
-from pymilvus import (
-    connections, FieldSchema, CollectionSchema, DataType,
-    Collection, utility, MilvusClient
+from typing import Dict, List
+
+# Добавляем корень проекта в sys.path для импорта rag_config
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from rag_config import settings
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%H:%M:%S",
 )
-from tqdm import tqdm
+logger = logging.getLogger("db_make")
 
-# ----------------------------
-# 1. НАСТРОЙКИ
-# ----------------------------
-DATA_FILE = "witcher3_knowledge_base.json"  # Выход парсера
-MILVUS_HOST = "localhost"
-MILVUS_PORT = "19530"
-COLLECTION_NAME = "witcher3_rag"
-EMBEDDING_MODEL = "BAAI/bge-m3"
-VECTOR_DIM = 1024
 
-# ----------------------------
-# 2. УМНЫЙ ЧАНКИНГ ПО АБЗАЦАМ
-# ----------------------------
-def chunk_by_paragraphs(text: str, max_chars: int = 500, overlap: int = 50) -> List[str]:
+def chunk_by_paragraphs(
+    text: str, max_chars: int = 2000, overlap: int = 100
+) -> List[str]:
     """
-    Разбивает текст на чанки по абзацам, не разрывая логические блоки.
+    Разбивает текст на логические чанки по абзацам.
+    Сохраняет целостность смысловых блоков, избегает разрыва предложений.
     """
-    paragraphs = text.split('\n')
-    chunks = []
+    paragraphs = text.split("\n")
+    chunks: List[str] = []
     current_chunk = ""
+
     for para in paragraphs:
         para = para.strip()
         if not para:
             continue
+
+        # Если абзац помещается в текущий чанк
         if len(current_chunk) + len(para) + 1 <= max_chars:
-            current_chunk += (" " + para) if current_chunk else para
+            current_chunk = f"{current_chunk} {para}" if current_chunk else para
         else:
             if current_chunk:
                 chunks.append(current_chunk)
+
+            # Если отдельный абзац превышает max_chars, режем его с перекрытием
             if len(para) > max_chars:
-                for i in range(0, len(para), max_chars - overlap):
-                    chunk_part = para[i:i + max_chars - overlap]
-                    chunks.append(chunk_part)
+                step = max(max_chars - overlap, 100)
+                for i in range(0, len(para), step):
+                    chunks.append(para[i : i + max_chars])
+                current_chunk = ""
             else:
                 current_chunk = para
+
     if current_chunk:
         chunks.append(current_chunk)
-    final_chunks = []
+
+    # Ограничение под максимальный размер VARCHAR в Milvus (65535 байт)
+    sanitized_chunks = []
     for chunk in chunks:
-        if len(chunk) > 65535:
-            final_chunks.append(chunk[:65530] + "... [обрезано]")
+        if len(chunk) > 65000:
+            sanitized_chunks.append(chunk[:65000] + "... [обрезано]")
         else:
-            final_chunks.append(chunk)
-    return final_chunks
+            sanitized_chunks.append(chunk)
 
-# ----------------------------
-# 3. ПОДКЛЮЧЕНИЕ К MILVUS
-# ----------------------------
-def setup_collection():
-    connections.connect("default", host=MILVUS_HOST, port=MILVUS_PORT)
-    print("✅ Подключено к Milvus (Docker)")
-    if utility.has_collection(COLLECTION_NAME):
-        utility.drop_collection(COLLECTION_NAME)
-        print(f"🗑️ Удалена старая коллекция: {COLLECTION_NAME}")
+    return sanitized_chunks
 
-    # Добавляем поле subcategory
+
+def setup_collection(
+    host: str = settings.MILVUS_HOST,
+    port: str = settings.MILVUS_PORT,
+    collection_name: str = settings.COLLECTION_NAME,
+    vector_dim: int = settings.VECTOR_DIM,
+    recreate: bool = True,
+):
+    """Подключается к Milvus и инициализирует коллекцию со схемой и HNSW-индексом."""
+    from pymilvus import (
+        Collection,
+        CollectionSchema,
+        DataType,
+        FieldSchema,
+        connections,
+        utility,
+    )
+
+    logger.info(f"🔌 Подключение к Milvus ({host}:{port})...")
+    connections.connect("default", host=host, port=port)
+    logger.info("✅ Успешное подключение к Milvus.")
+
+    if utility.has_collection(collection_name):
+        if recreate:
+            logger.info(f"🗑️ Удаление существующей коллекции: '{collection_name}'")
+            utility.drop_collection(collection_name)
+        else:
+            logger.info(f"ℹ️ Коллекция '{collection_name}' уже существует. Загрузка...")
+            collection = Collection(collection_name)
+            collection.load()
+            return collection
+
+    # Описание полей коллекции
     fields = [
         FieldSchema(name="id", dtype=DataType.INT64, is_primary=True, auto_id=True),
         FieldSchema(name="title", dtype=DataType.VARCHAR, max_length=512),
         FieldSchema(name="text", dtype=DataType.VARCHAR, max_length=65535),
         FieldSchema(name="url", dtype=DataType.VARCHAR, max_length=512),
         FieldSchema(name="subcategory", dtype=DataType.VARCHAR, max_length=128),
-        FieldSchema(name="vector", dtype=DataType.FLOAT_VECTOR, dim=VECTOR_DIM)
+        FieldSchema(name="vector", dtype=DataType.FLOAT_VECTOR, dim=vector_dim),
     ]
-    schema = CollectionSchema(fields, description="The Witcher 3 RAG")
-    collection = Collection(COLLECTION_NAME, schema)
 
-    # HNSW — хорош для точного поиска
-    # M: Максимальное количество связей для каждого узла. Увеличение улучшает качество поиска, но замедляет индексацию.
-    # efConstruction: Размер динамического списка кандидатов во время построения индекса. Чем больше, тем лучше качество, но медленнее построение.
-    # ef: Размер динамического списка кандидатов во время поиска. Чем больше, тем точнее поиск, но медленнее.
+    schema = CollectionSchema(
+        fields=fields,
+        description="The Witcher 3 RAG Knowledge Base (Fandom Wiki)",
+        enable_dynamic_field=False,
+    )
+    collection = Collection(name=collection_name, schema=schema)
+    logger.info(f"✅ Создана коллекция: '{collection_name}'")
+
+    # Создание индекса HNSW для быстрого и точного косинусного поиска
     index_params = {
         "index_type": "HNSW",
         "metric_type": "COSINE",
-        "params": {"M": 16, "efConstruction": 200, "ef": 100}
+        "params": {"M": 16, "efConstruction": 200},
     }
-    collection.create_index("vector", index_params)
-    collection.load()
-    print("✅ Коллекция создана и индексирована")
+    logger.info(f"🔨 Построение HNSW индекса для поля 'vector'...")
+    collection.create_index(field_name="vector", index_params=index_params)
+    logger.info("✅ Индекс успешно инициализирован.")
+
     return collection
 
-# ----------------------------
-# 4. ЗАГРУЗКА И ВСТАВКА
-# ----------------------------
-def load_and_insert(collection: Collection):
-    if not Path(DATA_FILE).exists():
-        raise FileNotFoundError(f"Нет файла: {DATA_FILE}")
-    
-    with open(DATA_FILE, "r", encoding="utf-8") as f:
-        data = json.load(f)
-    
-    print(f"✅ Загружено {len(data)} статей")
-    model = SentenceTransformer(EMBEDDING_MODEL)
-    print(f"✅ Модель {EMBEDDING_MODEL} загружена")
 
-    titles, texts, urls, subcategories, vectors = [], [], [], [], []
+def load_and_index_data(
+    collection,
+    data_file: Path,
+    batch_size: int = 64,
+    embedding_model_name: str = settings.EMBEDDING_MODEL,
+):
+    """
+    Считывает статьи из JSON, формирует чанки, выполняет пакетный расчет
+    эмбеддингов и загружает данные в Milvus.
+    """
+    from pymilvus import utility
+    from sentence_transformers import SentenceTransformer
+    from tqdm import tqdm
 
-    # Создаем один индикатор прогресса для всего процесса
-    with tqdm(total=len(data), desc="Обработка", unit="item") as pbar:
-        for item in data:
-            title = item.get('title', 'No Title')
-            formatted_title = f"{title[:20]}..." if len(title) > 23 else title
-            print(f"\r\033[94m{formatted_title}\033[0m", end="")
-            
-            # Обработка статьи
-            chunks = chunk_by_paragraphs(item["text"], max_chars=3000)
-            for chunk in chunks:
-                if len(chunk) >= 65535:
-                    chunk = chunk[:65000] + "..."
-                titles.append(item["title"])
-                texts.append(chunk)
-                urls.append(item["url"])
-                subcategories.append(item.get("subcategory", "unknown"))  # Добавляем подкатегорию
-                emb = model.encode(chunk, normalize_embeddings=True)
-                vectors.append(emb.tolist())
-            
-            # Обновляем индикатор прогресса
-            pbar.update(1)
-
-    print(f"🔄 Всего чанков: {len(texts)}")
-    print("📥 Вставка в Milvus...")
-    collection.insert([titles, texts, urls, subcategories, vectors])
-    collection.flush()
-    print(f"✅ Успешно вставлено {len(texts)} векторов")
-
-    # Ждём, пока данные будут доступны
-    print("⏳ Ожидание подтверждения вставки...")
-    collection.num_entities
-
-    # Ждём, пока индекс будет полностью построен
-    print("⏳ Ожидание завершения построения индекса...")
-    utility.wait_for_index_building_complete(COLLECTION_NAME)
-    print("✅ Индекс построен")
-
-    # Перезагружаем коллекцию
-    print("🔁 Перезагрузка коллекции в память...")
-    collection.load()
-    print("✅ Коллекция готова к поиску")
-
-# ----------------------------
-# 5. ПРОВЕРКА ПОИСКА С ФИЛЬТРОМ ПО ПОДКАТЕГОРИИ
-# ----------------------------
-def test_search(collection: Collection):
-    model = SentenceTransformer(EMBEDDING_MODEL)
-    query = "Что такое Дикая Охота?"
-    query_emb = model.encode(query, normalize_embeddings=True).tolist()
-
-    # Поиск с фильтром по подкатегории
-    search_params = {
-        "metric_type": "COSINE",
-        "params": {"ef": 200}
-    }
-    try:
-        # Пример фильтра: искать только в подкатегории "квесты"
-        results = collection.search(
-            data=[query_emb],
-            anns_field="vector",
-            param=search_params,
-            limit=3,
-            #expr='subcategory == "квесты"',  # Фильтр по подкатегории
-            output_fields=["title", "text", "url", "subcategory"]
+    if not data_file.exists():
+        raise FileNotFoundError(
+            f"Файл с базой знаний '{data_file}' не найден. "
+            "Запустите wiki_parser.py или укажите верный путь."
         )
-        #print(f"\n🔍 Поиск: '{query}' (фильтр: subcategory == 'квесты')")
-        for hits in results:
-            for hit in hits:
-                print(f"\n--- Результат {hit.rank} | Схожесть: {hit.distance:.4f} ---")
-                print(f"📌 {hit.entity.get('title')}")
-                print(f"🔗 {hit.entity.get('url')}")
-                print(f"🏷️ {hit.entity.get('subcategory')}")
-                print(f"💬 {hit.entity.get('text')[:400]}...")
-    except Exception as e:
-        print(f"❌ Ошибка при поиске: {e}")
 
-# ----------------------------
-# 6. ЗАПУСК
-# ----------------------------
-if __name__ == "__main__":
+    logger.info(f"📖 Чтение статей из '{data_file}'...")
+    with open(data_file, "r", encoding="utf-8") as f:
+        articles: List[Dict] = json.load(f)
+    logger.info(f"✅ Загружено {len(articles)} статей.")
+
+    logger.info(f"🧠 Загрузка модели эмбеддингов '{embedding_model_name}'...")
+    model = SentenceTransformer(embedding_model_name)
+    logger.info("✅ Модель эмбеддингов загружена.")
+
+    # 1. Формирование всех чанков с метаданными
+    logger.info("✂️ Нарезка статей на смысловые чанки...")
+    raw_chunks: List[Dict[str, str]] = []
+
+    for item in articles:
+        title = item.get("title", "Без названия")
+        url = item.get("url", "")
+        subcategory = item.get("subcategory", "Категория:Ведьмак 3")
+        text = item.get("text", "")
+
+        if not text.strip():
+            continue
+
+        chunks = chunk_by_paragraphs(
+            text,
+            max_chars=settings.CHUNK_MAX_CHARS,
+            overlap=settings.CHUNK_OVERLAP,
+        )
+
+        for chunk in chunks:
+            raw_chunks.append(
+                {
+                    "title": title,
+                    "text": chunk,
+                    "url": url,
+                    "subcategory": subcategory,
+                }
+            )
+
+    total_chunks = len(raw_chunks)
+    logger.info(f"📊 Итого сформировано чанков для индексации: {total_chunks}")
+
+    # 2. Пакетная генерация эмбеддингов и вставка в Milvus
+    insert_batch_size = 512
+    logger.info(
+        f"⚡ Генерация эмбеддингов (batch_size={batch_size}) и вставка в Milvus..."
+    )
+
+    start_time = time.time()
+    for i in tqdm(
+        range(0, total_chunks, insert_batch_size), desc="Индексация в Milvus"
+    ):
+        batch = raw_chunks[i : i + insert_batch_size]
+        batch_texts = [item["text"] for item in batch]
+
+        # Пакетное кодирование (быстрее в разы)
+        batch_vectors = model.encode(
+            batch_texts,
+            batch_size=batch_size,
+            show_progress_bar=False,
+            normalize_embeddings=True,
+        ).tolist()
+
+        b_titles = [item["title"] for item in batch]
+        b_urls = [item["url"] for item in batch]
+        b_subcats = [item["subcategory"] for item in batch]
+
+        collection.insert([b_titles, batch_texts, b_urls, b_subcats, batch_vectors])
+
+    # Фиксация данных
+    logger.info("💾 Сброс буферов (flush) в Milvus...")
+    collection.flush()
+
+    elapsed = time.time() - start_time
+    logger.info(f"⏱️ Вставка завершена за {elapsed:.1f} сек. ({total_chunks / max(elapsed, 0.01):.1f} чанков/сек)")
+
+    logger.info("⏳ Ожидание завершения построения индекса...")
+    utility.wait_for_index_building_complete(collection.name)
+
+    logger.info("🔁 Загрузка коллекции в оперативную память Milvus...")
+    collection.load()
+    logger.info(f"🎉 Индексация полностью завершена! Всего векторов в базе: {collection.num_entities}")
+
+
+def parse_arguments() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Создание и индексация коллекции Witcher 3 в Milvus."
+    )
+    parser.add_argument(
+        "--data-file",
+        type=str,
+        default=str(settings.DATA_FILE),
+        help=f"Путь к JSON-файлу базы знаний (по умолчанию: '{settings.DATA_FILE}')",
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=64,
+        help="Размер пакета (batch size) для генерации эмбеддингов (по умолчанию: 64)",
+    )
+    parser.add_argument(
+        "--no-recreate",
+        action="store_true",
+        help="Не удалять существующую коллекцию, если она уже создана",
+    )
+    return parser.parse_args()
+
+
+def main():
+    args = parse_arguments()
     try:
-        collection = setup_collection()
-        load_and_insert(collection)
-        test_search(collection)
+        from pymilvus import connections
+    except ImportError as e:
+        logger.error(
+            f"❌ Не установлены необходимые пакеты ({e}).\n"
+            f"Установите зависимости: pip install -r requirements.txt"
+        )
+        sys.exit(1)
+
+    try:
+        collection = setup_collection(
+            host=settings.MILVUS_HOST,
+            port=settings.MILVUS_PORT,
+            collection_name=settings.COLLECTION_NAME,
+            vector_dim=settings.VECTOR_DIM,
+            recreate=not args.no_recreate,
+        )
+        load_and_index_data(
+            collection=collection,
+            data_file=Path(args.data_file),
+            batch_size=args.batch_size,
+            embedding_model_name=settings.EMBEDDING_MODEL,
+        )
     except Exception as e:
-        print(f"❌ Ошибка: {e}")
+        logger.error(f"❌ Ошибка при индексации: {e}", exc_info=True)
     finally:
         connections.disconnect("default")
+
+
+if __name__ == "__main__":
+    main()
